@@ -15,7 +15,7 @@
   const defaultSettings = {
     enabled: true,
     autoHide: true,
-    exclusive: false,
+    exclusive: true,
     fabPosition: { left: null, top: null, right: 20, bottom: 100 },
     windows: [],
   };
@@ -48,7 +48,7 @@
 
   let settings = loadSettings();
 
-  // ---------- 显示 / 隐藏 ----------
+  // ---------- 显示 / 隐藏（用「移出屏幕」代替 display:none，减少和插件打架闪烁）----------
   function resolveElements(selector) {
     try {
       return Array.from(parentDoc.querySelectorAll(selector));
@@ -57,54 +57,294 @@
     }
   }
 
-  function hideWindow(win) {
-    resolveElements(win.selector).forEach((el) => {
-      if (!el.dataset.fwhOriginalDisplay) {
-        el.dataset.fwhOriginalDisplay = el.style.display || '';
+  /** 从元素猜一个可读名字，避免菜单里只显示 #id */
+  function guessElementName(el, selector) {
+    const aria = el.getAttribute('aria-label') || el.getAttribute('title') || el.getAttribute('data-title') || '';
+    if (aria.trim()) return aria.trim().slice(0, 30);
+
+    // 常见插件 class 关键词
+    const cls = (el.className && String(el.className)) || '';
+    const id = el.id || '';
+    const blob = (cls + ' ' + id).toLowerCase();
+    const map = [
+      [/om-fab|outfit|穿搭|fa-shirt/, '穿搭管理'],
+      [/scene|tsp-fab|酒馆场景|tag-market/, '酒馆场景'],
+      [/jumper|chat-jumper|楼层/, '楼层跳转'],
+      [/quickbar|quick-bar/, '快捷栏'],
+      [/tracker|stat/, '状态追踪'],
+      [/calendar|月历/, '月历'],
+      [/float.*nav|导航/, '悬浮导航'],
+      [/image|gallery|图片/, '图片相关'],
+      [/music|audio|音乐/, '音乐'],
+      [/qr|quick.?reply/, '快速回复'],
+    ];
+    for (const [re, name] of map) {
+      if (re.test(blob)) return name;
+    }
+
+    const text = (el.innerText || '').replace(/\s+/g, ' ').trim();
+    if (text && text.length <= 20 && !/^[#.]/.test(text)) return text;
+
+    // class 里挑一个不像哈希的
+    const niceClass = Array.from(el.classList || []).find(
+      (c) => c.length > 2 && c.length < 24 && !/^[a-f0-9]{6,}$/i.test(c) && !c.startsWith('fa-'),
+    );
+    if (niceClass) return niceClass;
+
+    if (id && id.length < 30) return id;
+    return selector.length > 28 ? selector.slice(0, 28) + '…' : selector;
+  }
+
+  function isOutfitManagerWin(win) {
+    const s = (win && win.selector) || '';
+    const n = (win && win.name) || '';
+    return /om-fab|#om-fab|outfit/i.test(s) || /穿搭/.test(n);
+  }
+
+  /**
+   * 穿搭管理器每 3 秒 injectFab，会用内联 !important 把 opacity/display 写死。
+   * 和它抢内联样式 = 必闪。改为只挂「全局 CSS」：
+   * - 它从不写 transform，所以 scale(0) 能稳定盖住
+   * - 不碰 display/visibility/opacity/屏内位置，避免 fabNeedsRebuild
+   * 无定时器打架，不应再闪。
+   */
+  function setOutfitFabCssHidden(hidden) {
+    const id = 'fwh-om-fab-hide-css';
+    let style = parentDoc.getElementById(id);
+    if (hidden) {
+      if (!style) {
+        style = parentDoc.createElement('style');
+        style.id = id;
+        (parentDoc.head || parentDoc.documentElement).appendChild(style);
       }
-      el.style.display = 'none';
-      el.dataset.fwhHiddenBy = 'fwh';
-    });
+      style.textContent = `
+#om-fab-main {
+  transform: scale(0) !important;
+  pointer-events: none !important;
+}
+#om-fab-main #om-fab-main-btn,
+#om-fab-main * {
+  pointer-events: none !important;
+}
+`;
+    } else if (style) {
+      style.remove();
+    }
+  }
+
+  function hideElement(el) {
+    if (!el || el.id === FAB_ID || el.closest?.('#' + FAB_ID)) return;
+    if (el.id === 'om-fab-main' || el.closest?.('#om-fab-main')) {
+      setOutfitFabCssHidden(true);
+      return;
+    }
+    if (!el.dataset.fwhSaved) {
+      el.dataset.fwhSaved = '1';
+      el.dataset.fwhCssText = el.style.cssText || '';
+    }
+    el.style.setProperty('transform', 'scale(0)', 'important');
+    el.style.setProperty('pointer-events', 'none', 'important');
+    el.dataset.fwhHiddenBy = 'fwh';
+  }
+
+  function restoreElementStyles(el) {
+    if (!el) return;
+    if (el.id === 'om-fab-main' || el.closest?.('#om-fab-main')) {
+      setOutfitFabCssHidden(false);
+      return;
+    }
+    const saved = el.dataset.fwhCssText;
+    el.style.cssText = saved != null ? saved : '';
+    delete el.dataset.fwhHiddenBy;
+    delete el.dataset.fwhSaved;
+    delete el.dataset.fwhCssText;
+  }
+
+  function showElementInPlace(el) {
+    if (!el) return;
+    restoreElementStyles(el);
+  }
+
+  function hideWindow(win) {
+    if (isOutfitManagerWin(win)) {
+      setOutfitFabCssHidden(true);
+      win.hidden = true;
+      return;
+    }
+    resolveElements(win.selector).forEach(hideElement);
     win.hidden = true;
   }
 
-  function showWindow(win) {
-    resolveElements(win.selector).forEach((el) => {
-      const original = el.dataset.fwhOriginalDisplay;
-      el.style.display = original !== undefined && original !== '' ? original : '';
-      delete el.dataset.fwhHiddenBy;
-      delete el.dataset.fwhOriginalDisplay;
+  /** 打开/关闭穿搭管理面板，悬浮球始终保持隐藏 */
+  function openOutfitManagerPanel() {
+    setOutfitFabCssHidden(true);
+
+    const ov = parentDoc.querySelector('.om-overlay');
+    if (ov) {
+      const x = ov.querySelector('#om-x');
+      if (x) x.click();
+      else ov.remove();
+      toastr?.info?.('已关闭穿搭管理');
+      return;
+    }
+
+    // 侧栏扩展按钮（不经过悬浮球）
+    const sideBtn = parentDoc.getElementById('outfit-mgr-ext-btn-v4');
+    if (sideBtn) {
+      sideBtn.click();
+      toastr?.success?.('已打开穿搭管理');
+      return;
+    }
+
+    // 兜底：点一下球再立刻藏回去
+    setOutfitFabCssHidden(false);
+    parentWin.requestAnimationFrame(() => {
+      const btn =
+        parentDoc.getElementById('om-fab-main-btn') ||
+        parentDoc.querySelector('#om-fab-main img, #om-fab-main > div');
+      if (btn) {
+        btn.dispatchEvent(
+          new parentWin.MouseEvent('click', { bubbles: true, cancelable: true, view: parentWin }),
+        );
+      } else {
+        toastr?.warning?.('打不开穿搭管理：请确认插件已加载');
+      }
+      parentWin.setTimeout(() => setOutfitFabCssHidden(true), 40);
     });
-    win.hidden = false;
+  }
+
+  /** 像悬浮球（小按钮）还是整块面板 */
+  function isLikelyFab(el) {
+    if (!el) return true;
+    if (el.id === 'om-fab-main') return true;
+    try {
+      const r = el.getBoundingClientRect();
+      // 未显示时用 scroll 尺寸兜底
+      const w = r.width || el.offsetWidth || 40;
+      const h = r.height || el.offsetHeight || 40;
+      return w > 0 && h > 0 && w <= 120 && h <= 120;
+    } catch {
+      return true;
+    }
+  }
+
+  /**
+   * 启动器式打开（通用）：
+   * - 悬浮球类：短暂显示 → 点击打开插件界面 → 再把球藏回去（保持「已隐藏」）
+   * - 大面板类：显示出来供使用；再点一次菜单可收起
+   */
+  function openAsLauncher(win) {
+    if (isOutfitManagerWin(win)) {
+      openOutfitManagerPanel();
+      win.hidden = true;
+      setOutfitFabCssHidden(true);
+      return;
+    }
+
+    const els = resolveElements(win.selector);
+    if (!els.length) {
+      toastr?.warning?.(`未找到：${win.name}`);
+      return;
+    }
+    const root = els[0];
+    const fabLike = isLikelyFab(root);
+
+    // 先显示，才能点到
+    els.forEach(showElementInPlace);
+
+    parentWin.setTimeout(() => {
+      try {
+        const t =
+          root.querySelector?.('#om-fab-main-btn,button,[role="button"],img,a,.fa-solid') || root;
+        t.dispatchEvent(
+          new parentWin.MouseEvent('click', { bubbles: true, cancelable: true, view: parentWin }),
+        );
+      } catch {}
+
+      if (fabLike) {
+        // 球只负责「点一下打开」，界面一般是另一个 DOM，球继续藏
+        parentWin.setTimeout(() => {
+          els.forEach(hideElement);
+          win.hidden = true;
+          saveSettings(settings);
+          renderMenu();
+        }, 120);
+        toastr?.success?.(`已打开：${win.name}（悬浮球保持隐藏）`);
+      } else {
+        // 注册的是整块面板：保持显示，再点菜单可隐藏
+        win.hidden = false;
+        saveSettings(settings);
+        renderMenu();
+        toastr?.success?.(`已显示：${win.name}`);
+      }
+    }, 40);
+  }
+
+  function showWindow(win) {
+    openAsLauncher(win);
   }
 
   function toggleWindow(win) {
-    if (win.hidden) {
-      if (settings.exclusive) {
-        settings.windows.forEach((w) => {
-          if (w !== win && !w.hidden) hideWindow(w);
-        });
-      }
-      showWindow(win);
-    } else {
-      hideWindow(win);
+    closeMenu();
+
+    if (isOutfitManagerWin(win)) {
+      openOutfitManagerPanel();
+      win.hidden = true;
+      setOutfitFabCssHidden(true);
+      saveSettings(settings);
+      renderMenu();
+      return;
     }
-    saveSettings(settings);
-    renderMenu();
+
+    // 大面板且当前正在显示 → 再点一次 = 收起
+    if (!win.hidden) {
+      const els = resolveElements(win.selector);
+      const panelOpen = els.length && !isLikelyFab(els[0]);
+      if (panelOpen) {
+        hideWindow(win);
+        toastr?.info?.(`已隐藏：${win.name}`);
+        saveSettings(settings);
+        renderMenu();
+        return;
+      }
+    }
+
+    // 默认：启动器打开（藏球 / 显示面板）
+    openAsLauncher(win);
   }
 
   function hideAll() {
     settings.windows.forEach(hideWindow);
     saveSettings(settings);
     renderMenu();
-    toastr?.info?.('已隐藏全部注册悬浮窗');
+    toastr?.info?.('已全部隐藏');
   }
 
   function showAll() {
-    settings.windows.forEach(showWindow);
+    settings.windows.forEach((w) => {
+      if (isOutfitManagerWin(w)) {
+        // 穿搭球仍保持隐藏，只打开面板
+        openOutfitManagerPanel();
+        w.hidden = true;
+      } else {
+        resolveElements(w.selector).forEach(showElementInPlace);
+        w.hidden = false;
+      }
+    });
     saveSettings(settings);
     renderMenu();
-    toastr?.info?.('已显示全部注册悬浮窗');
+    toastr?.info?.('已处理全部');
+  }
+
+  // 关掉 200ms 抢样式（那是闪烁主因）；穿搭只靠 CSS 规则
+  let rehideTimer = null;
+  function startRehideWatch() {
+    settings.windows.forEach((w) => {
+      if (w.hidden && isOutfitManagerWin(w)) setOutfitFabCssHidden(true);
+    });
+  }
+  function stopRehideWatch() {
+    setOutfitFabCssHidden(false);
   }
 
   // ---------- 注入样式到父页面 ----------
@@ -141,14 +381,26 @@
 #fwh-fab-container.menu-down #fwh-menu { bottom: auto; top: 58px; }
 .fwh-menu-header { padding: 8px 14px 6px; font-size: 12px; opacity: .7; text-transform: uppercase; letter-spacing: .5px; }
 .fwh-menu-item {
-  display: flex; align-items: center; gap: 10px; padding: 10px 14px; cursor: pointer;
+  display: flex; align-items: center; gap: 6px; padding: 6px 8px 6px 14px;
   transition: background .12s ease; font-size: 14px;
 }
-.fwh-menu-item:hover { background: rgba(255,255,255,.08); }
-.fwh-menu-item.active { background: rgba(108,92,231,.25); }
+.fwh-menu-item:hover { background: rgba(255,255,255,.06); }
+.fwh-menu-item.active { background: rgba(108,92,231,.18); }
 .fwh-menu-item .fwh-item-icon { width: 18px; text-align: center; opacity: .85; }
-.fwh-menu-item .fwh-item-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.fwh-menu-item .fwh-item-status { font-size: 11px; opacity: .6; }
+.fwh-menu-item .fwh-item-name {
+  flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  cursor: pointer; padding: 6px 0;
+}
+.fwh-menu-item .fwh-item-name:hover { color: #a29bfe; }
+.fwh-menu-item .fwh-eye-btn {
+  flex-shrink: 0; width: 32px; height: 28px; border: none; border-radius: 6px;
+  background: transparent; color: inherit; cursor: pointer; opacity: .75;
+  display: flex; align-items: center; justify-content: center; font-size: 14px; padding: 0;
+}
+.fwh-menu-item .fwh-eye-btn:hover { opacity: 1; background: rgba(255,255,255,.12); }
+.fwh-menu-item .fwh-eye-btn.is-hidden { opacity: .4; }
+.fwh-menu-item .fwh-item-status { font-size: 11px; opacity: .55; min-width: 2.2em; text-align: right; }
+.fwh-menu-item[data-action] { cursor: pointer; gap: 10px; padding: 10px 14px; }
 .fwh-menu-divider { height: 1px; background: rgba(255,255,255,.1); margin: 4px 10px; }
 .fwh-menu-empty { padding: 16px 14px; text-align: center; opacity: .6; font-size: 13px; }
 #fwh-settings-modal {
@@ -168,6 +420,29 @@
 #fwh-settings-panel .fwh-hint { font-size: 12px; opacity: .7; line-height: 1.4; margin-top: 6px; }
 #fwh-settings-panel .fwh-scan-item { padding: 4px 0; cursor: pointer; font-size: 12px; }
 #fwh-settings-panel .fwh-scan-item:hover { background: rgba(128,128,128,.15); }
+#fwh-host-panel {
+  position: fixed; z-index: 99997; display: none; flex-direction: column;
+  left: 50%; top: 50%; transform: translate(-50%, -50%);
+  width: min(520px, 92vw); height: min(70vh, 640px);
+  background: var(--SmartThemeBlurTintColor, #1e1e28);
+  border: 1px solid var(--SmartThemeBorderColor, rgba(255,255,255,.15));
+  border-radius: 12px; box-shadow: 0 12px 40px rgba(0,0,0,.5);
+  overflow: hidden;
+}
+#fwh-host-panel .fwh-host-bar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 8px 12px; cursor: move; user-select: none;
+  background: rgba(108,92,231,.25); border-bottom: 1px solid rgba(255,255,255,.08);
+  font-size: 14px; flex-shrink: 0;
+}
+#fwh-host-panel .fwh-host-close {
+  border: none; background: transparent; color: inherit; font-size: 20px;
+  line-height: 1; cursor: pointer; padding: 0 6px; opacity: .8;
+}
+#fwh-host-panel .fwh-host-close:hover { opacity: 1; }
+#fwh-host-panel .fwh-host-body {
+  flex: 1; overflow: auto; padding: 8px; position: relative;
+}
     `;
     parentDoc.head.appendChild(style);
   }
@@ -315,6 +590,25 @@
       .replace(/"/g, '&quot;');
   }
 
+  /** 只改显示/隐藏，不触发「打开插件」 */
+  function setWindowVisible(win, visible) {
+    if (visible) {
+      if (isOutfitManagerWin(win)) {
+        setOutfitFabCssHidden(false);
+        win.hidden = false;
+      } else {
+        resolveElements(win.selector).forEach(showElementInPlace);
+        win.hidden = false;
+      }
+      toastr?.info?.(`已显示：${win.name}`);
+    } else {
+      hideWindow(win);
+      toastr?.info?.(`已隐藏：${win.name}`);
+    }
+    saveSettings(settings);
+    renderMenu();
+  }
+
   function renderMenu() {
     const menu = parentDoc.getElementById('fwh-menu');
     if (!menu) return;
@@ -323,16 +617,19 @@
     if (!settings.windows.length) {
       html += `<div class="fwh-menu-empty">暂无注册悬浮窗<br>请点下方「打开设置」添加</div>`;
     } else {
-      html += `<div class="fwh-menu-header">已注册悬浮窗</div>`;
+      html += `<div class="fwh-menu-header">点名字=打开 · 眼睛=显隐</div>`;
       settings.windows.forEach((win, idx) => {
-        const status = win.hidden ? '已隐藏' : '显示中';
-        const icon = win.hidden ? 'fa-eye-slash' : 'fa-eye';
         const active = win.hidden ? '' : 'active';
+        const eyeIcon = win.hidden ? 'fa-eye-slash' : 'fa-eye';
+        const eyeTitle = win.hidden ? '显示悬浮球/窗' : '隐藏悬浮球/窗';
+        const eyeClass = win.hidden ? 'is-hidden' : '';
         html += `
-          <div class="fwh-menu-item ${active}" data-idx="${idx}">
-            <span class="fwh-item-icon"><i class="fa-solid ${icon}"></i></span>
-            <span class="fwh-item-name">${escapeHtml(win.name)}</span>
-            <span class="fwh-item-status">${status}</span>
+          <div class="fwh-menu-item ${active}">
+            <span class="fwh-item-name" data-open-idx="${idx}" title="打开插件">${escapeHtml(win.name)}</span>
+            <span class="fwh-item-status">${win.hidden ? '已藏' : '显示'}</span>
+            <button type="button" class="fwh-eye-btn ${eyeClass}" data-eye-idx="${idx}" title="${eyeTitle}">
+              <i class="fa-solid ${eyeIcon}"></i>
+            </button>
           </div>`;
       });
     }
@@ -344,11 +641,25 @@
 
     menu.innerHTML = html;
 
-    menu.querySelectorAll('[data-idx]').forEach((el) => {
+    // 点名字 → 只打开插件（启动器）
+    menu.querySelectorAll('[data-open-idx]').forEach((el) => {
       el.addEventListener('click', (e) => {
         e.stopPropagation();
-        const win = settings.windows[Number(el.dataset.idx)];
-        if (win) toggleWindow(win);
+        const win = settings.windows[Number(el.dataset.openIdx)];
+        if (!win) return;
+        closeMenu();
+        openAsLauncher(win);
+        saveSettings(settings);
+        renderMenu();
+      });
+    });
+    // 点眼睛 → 只切换显示/隐藏
+    menu.querySelectorAll('[data-eye-idx]').forEach((btn) => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const win = settings.windows[Number(btn.dataset.eyeIdx)];
+        if (!win) return;
+        setWindowVisible(win, !!win.hidden);
       });
     });
     menu.querySelector('[data-action="hide-all"]')?.addEventListener('click', (e) => { e.stopPropagation(); hideAll(); });
@@ -483,11 +794,9 @@
         }
         if (!selector || seen.has(selector)) return;
         seen.add(selector);
-        candidates.push({
-          selector,
-          text: (el.innerText || el.getAttribute('title') || '').slice(0, 24).trim(),
-          z,
-        });
+        // 尽量起一个好看的中文/可读名字，而不是 #xxx
+        const name = guessElementName(el, selector);
+        candidates.push({ selector, text: name, z });
       });
       candidates.sort((a, b) => b.z - a.z);
       if (!candidates.length) {
@@ -495,13 +804,15 @@
         return;
       }
       result.innerHTML =
-        '<div class="fwh-hint">点击添加：</div>' +
+        '<div class="fwh-hint">点击添加（可稍后在列表里改名字）：</div>' +
         candidates
           .slice(0, 25)
           .map(
             (c) =>
-              `<div class="fwh-scan-item" data-s="${escapeHtml(c.selector)}" data-n="${escapeHtml(c.text || c.selector)}">
-                <code>${escapeHtml(c.selector)}</code> <span style="opacity:.6">z=${c.z}</span> ${c.text ? escapeHtml(c.text) : ''}
+              `<div class="fwh-scan-item" data-s="${escapeHtml(c.selector)}" data-n="${escapeHtml(c.text)}">
+                <b>${escapeHtml(c.text)}</b>
+                <code style="opacity:.65;font-size:11px">${escapeHtml(c.selector)}</code>
+                <span style="opacity:.5">z=${c.z}</span>
               </div>`,
           )
           .join('');
@@ -512,12 +823,17 @@
             toastr?.info?.('已存在');
             return;
           }
-          settings.windows.push({ name: item.dataset.n || sel, selector: sel, hidden: false });
+          // 添加时弹出改名，避免一直是 #id
+          let displayName = item.dataset.n || sel;
+          const input = parentWin.prompt('给这个悬浮窗起个名字（例如：场景插件 / 楼层跳转）', displayName);
+          if (input === null) return;
+          displayName = (input || displayName).trim() || displayName;
+          settings.windows.push({ name: displayName, selector: sel, hidden: false });
           if (settings.autoHide) hideWindow(settings.windows[settings.windows.length - 1]);
           saveSettings(settings);
           renderList();
           renderMenu();
-          toastr?.success?.('已添加');
+          toastr?.success?.('已添加：' + displayName);
         });
       });
     });
@@ -548,13 +864,16 @@
     settings = loadSettings();
     if (!settings.enabled) return;
     createFab();
-    if (settings.autoHide && settings.windows.length) {
+    // 恢复上次的隐藏状态
+    if (settings.windows.length) {
       settings.windows.forEach((w) => {
-        if (w.hidden !== false) hideWindow(w);
+        if (settings.autoHide || w.hidden) hideWindow(w);
+        else showWindow(w);
       });
       saveSettings(settings);
       renderMenu();
     }
+    startRehideWatch();
     console.log('[悬浮窗聚合助手] 已启动');
   }
 
@@ -564,9 +883,16 @@
   });
 
   $(window).on('pagehide', () => {
-    // 关闭脚本时恢复显示，避免残留隐藏
     try {
-      settings.windows.forEach(showWindow);
+      stopRehideWatch();
+      settings.windows.forEach((w) => {
+        resolveElements(w.selector).forEach((el) => {
+          if (el.dataset.fwhCssText != null || el.dataset.fwhHiddenBy) restoreElementStyles(el);
+        });
+        w.hidden = false;
+      });
+      const om = parentDoc.getElementById('om-fab-main');
+      if (om && (om.dataset.fwhCssText != null || om.dataset.fwhHiddenBy)) restoreElementStyles(om);
       destroyFab();
       parentDoc.getElementById('fwh-settings-modal')?.remove();
     } catch {}
